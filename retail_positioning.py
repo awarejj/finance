@@ -131,16 +131,39 @@ DAILYFX_SLUGS = {
     "XAU/USD": "gold",
 }
 
+DAILYFX_HEADERS = {
+    **HEADERS,
+    "Referer": "https://www.dailyfx.com/sentiment",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+}
+
 
 def _dailyfx_fetch() -> list[PositionRow]:
+    import re
     from bs4 import BeautifulSoup
 
     rows: list[PositionRow] = []
+    session = requests.Session()
+    session.headers.update(DAILYFX_HEADERS)
+
+    # Warm up: visit main page so session gets cookies
+    try:
+        session.get("https://www.dailyfx.com/sentiment", timeout=TIMEOUT)
+        time.sleep(1)
+    except Exception:
+        pass
 
     for label, slug in DAILYFX_SLUGS.items():
         url = f"https://www.dailyfx.com/sentiment/{slug}"
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            resp = session.get(url, timeout=TIMEOUT)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "lxml")
 
@@ -168,7 +191,6 @@ def _dailyfx_fetch() -> list[PositionRow]:
 
             # Fallback: look for text like "68% of traders are net-long"
             if not long_pct:
-                import re
                 match = re.search(r"(\d+(?:\.\d+)?)\s*%\s*of\s*(?:retail\s*)?traders?\s*are\s*net.long", resp.text, re.IGNORECASE)
                 if match:
                     long_pct = float(match.group(1))
