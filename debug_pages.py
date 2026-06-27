@@ -1,14 +1,32 @@
-"""Debug script to inspect raw page content for failing instruments."""
+"""Debug: find correct URLs and IG sentiment API call."""
 
 from playwright.sync_api import sync_playwright
 import re
 
-PAGES = {
-    "dailyfx_usdjpy": "https://www.dailyfx.com/usd-jpy",
-    "dailyfx_gold": "https://www.dailyfx.com/gold",
-    "ig_audusd": "https://www.ig.com/en/forex/aud-usd",
-    "oanda": "https://www.oanda.com/us-en/trading/position-ratios/",
+# Alternative DailyFX URLs to try for USD/JPY and XAU/USD
+DAILYFX_ALT = {
+    "usd-jpy": [
+        "https://www.dailyfx.com/usd-jpy",
+        "https://www.dailyfx.com/usd-jpy-rate-forecast",
+        "https://www.dailyfx.com/japanese-yen",
+        "https://www.dailyfx.com/usdjpy",
+    ],
+    "gold": [
+        "https://www.dailyfx.com/gold",
+        "https://www.dailyfx.com/xau-usd",
+        "https://www.dailyfx.com/gold-price",
+        "https://www.dailyfx.com/xauusd",
+    ],
 }
+
+# Alternative OANDA URLs
+OANDA_ALTS = [
+    "https://www.oanda.com/us-en/trading/open-position-ratios/",
+    "https://www.oanda.com/us-en/analysis/",
+    "https://www.oanda.com/us-en/trading/",
+    "https://www.oanda.com/forex-trading/analysis/",
+    "https://www.oanda.com/us-en/trading/market-pulse/",
+]
 
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
@@ -18,48 +36,58 @@ with sync_playwright() as p:
     )
     page = context.new_page()
 
-    # Capture XHR responses
-    xhr_urls = []
+    # --- DailyFX URL search ---
+    print("=" * 60)
+    print("DAILYFX: searching for working URLs")
+    for key, urls in DAILYFX_ALT.items():
+        print(f"\n  [{key}]")
+        for url in urls:
+            try:
+                resp = page.goto(url, timeout=15000, wait_until="domcontentloaded")
+                size = len(page.content())
+                long_vals = re.findall(r'--long-percent:\s*([\d.]+)%', page.content())
+                print(f"    {url}")
+                print(f"      -> {size:,} bytes | --long-percent: {long_vals} | final URL: {page.url}")
+                if size > 1000:
+                    break  # found a working URL
+            except Exception as exc:
+                print(f"    {url} -> FAILED: {exc}")
+
+    # --- OANDA URL search ---
+    print("\n" + "=" * 60)
+    print("OANDA: searching for working URLs")
+    for url in OANDA_ALTS:
+        try:
+            page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            size = len(page.content())
+            is_404 = "doesn't exist" in page.content() or "not found" in page.content().lower()
+            print(f"  {url}")
+            print(f"    -> {size:,} bytes | 404={is_404} | final URL: {page.url}")
+        except Exception as exc:
+            print(f"  {url} -> FAILED: {exc}")
+
+    # --- IG: wait for network idle and capture ALL API calls ---
+    print("\n" + "=" * 60)
+    print("IG: capturing all API/XHR calls on AUD/USD page")
+    api_calls = []
+
     def on_response(resp):
-        if any(k in resp.url for k in ["sentiment", "position", "ratio", "long", "short"]):
-            xhr_urls.append(resp.url)
+        ct = resp.headers.get("content-type", "")
+        if "json" in ct or "sentiment" in resp.url.lower() or "position" in resp.url.lower():
+            try:
+                data = resp.json()
+                api_calls.append((resp.url, data))
+            except Exception:
+                api_calls.append((resp.url, None))
+
     page.on("response", on_response)
+    page.goto("https://www.ig.com/en/forex/aud-usd", timeout=30000, wait_until="networkidle")
+    page.wait_for_timeout(5000)
 
-    for name, url in PAGES.items():
-        xhr_urls.clear()
-        print(f"\n{'='*60}")
-        print(f"PAGE: {name}")
-        print(f"URL:  {url}")
-        page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        page.wait_for_timeout(4000)
-        content = page.content()
-
-        print(f"Size: {len(content):,} bytes")
-
-        # Check for --long-percent
-        matches = re.findall(r'--long-percent:\s*([\d.]+)%', content)
-        print(f"--long-percent values: {matches}")
-
-        # Check for any sentiment/position numbers
-        for pattern, label in [
-            (r'long["\s:]+(\d+(?:\.\d+)?)', "long values"),
-            (r'short["\s:]+(\d+(?:\.\d+)?)', "short values"),
-            (r'(\d+(?:\.\d+)?)\s*%', "% values in page"),
-        ]:
-            hits = re.findall(pattern, content, re.IGNORECASE)[:5]
-            if hits:
-                print(f"  {label}: {hits}")
-
-        # XHR calls
-        if xhr_urls:
-            print(f"  XHR sentiment URLs: {xhr_urls[:5]}")
-
-        # Print lines with relevant keywords
-        hits = [l.strip() for l in content.splitlines()
-                if any(k in l.lower() for k in ["long-percent", "sentiment", "percent", "ratio"])
-                and len(l.strip()) < 200]
-        print(f"  Relevant lines ({len(hits)}):")
-        for h in hits[:10]:
-            print(f"    {h}")
+    print(f"  Captured {len(api_calls)} JSON API calls:")
+    for url, data in api_calls[:20]:
+        preview = str(data)[:120] if data else "(non-JSON)"
+        print(f"  {url}")
+        print(f"    {preview}")
 
     browser.close()
