@@ -226,37 +226,112 @@ OANDA_INSTRUMENTS = {
     "XAU/USD": "XAU_USD",
 }
 
+# OANDA URL candidates to try in order
+OANDA_URL_TEMPLATES = [
+    "https://www.oanda.com/forex-trading/analysis/open-position-ratios/{instrument}",
+    "https://www.oanda.com/openpositions/{instrument}",
+    "https://fxtrade.oanda.com/analysis/open-position-ratios/{instrument}",
+]
+
+
+def _oanda_parse(data: dict) -> tuple[float, float] | tuple[None, None]:
+    """Try common response shapes and return (long_pct, short_pct) or (None, None)."""
+    import re
+
+    # Flatten one level if wrapped
+    d = data.get("data", data)
+    if isinstance(d, list) and d:
+        d = d[0]
+
+    candidates = [
+        (d.get("long"), d.get("short")),
+        (d.get("longPositions"), d.get("shortPositions")),
+        (d.get("percentLong"), d.get("percentShort")),
+        (d.get("pc_long"), d.get("pc_short")),
+    ]
+    for long_val, short_val in candidates:
+        try:
+            if long_val is not None and short_val is not None:
+                return round(float(long_val), 1), round(float(short_val), 1)
+        except (ValueError, TypeError):
+            pass
+    return None, None
+
 
 def _oanda_fetch() -> list[PositionRow]:
-    """Fetch OANDA open position ratios from their public lab API."""
+    """Scrape OANDA open position ratios from their public analysis page."""
+    import re
+    from bs4 import BeautifulSoup
+
     rows: list[PositionRow] = []
+    session = requests.Session()
+    session.headers.update({
+        **HEADERS,
+        "Referer": "https://www.oanda.com/forex-trading/analysis/open-position-ratios",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    # Warm up session
+    try:
+        session.get("https://www.oanda.com/forex-trading/analysis/open-position-ratios", timeout=TIMEOUT)
+        time.sleep(1)
+    except Exception:
+        pass
 
     for label, instrument in OANDA_INSTRUMENTS.items():
-        url = f"https://www.oanda.com/cfds/open-position-ratios/{instrument}/latest"
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
+        long_pct = short_pct = None
 
-            # Response: {"data": {"long": 55.2, "short": 44.8, ...}}
-            d = data.get("data", data)
-            long_pct = float(d.get("long") or d.get("longPositions") or 0)
-            short_pct = float(d.get("short") or d.get("shortPositions") or 0)
+        # Try each URL template
+        for template in OANDA_URL_TEMPLATES:
+            url = template.format(instrument=instrument)
+            try:
+                resp = session.get(url, timeout=TIMEOUT)
+                if resp.status_code == 404:
+                    continue
+                resp.raise_for_status()
 
-            if long_pct:
-                rows.append(PositionRow(
-                    source="OANDA",
-                    instrument=label,
-                    long_pct=round(long_pct, 1),
-                    short_pct=round(short_pct, 1),
-                ))
-                print(f"  [OANDA] {label}: {long_pct:.1f}% long / {short_pct:.1f}% short")
-            else:
-                print(f"  [OANDA] {label}: unexpected response format")
-        except Exception as exc:
-            print(f"  [OANDA] {label} failed: {exc}")
+                # Try JSON response first
+                try:
+                    data = resp.json()
+                    long_pct, short_pct = _oanda_parse(data)
+                    if long_pct:
+                        break
+                except ValueError:
+                    pass
 
-        time.sleep(0.3)
+                # Try scraping HTML
+                soup = BeautifulSoup(resp.text, "lxml")
+
+                # Look for JSON embedded in <script> tags
+                for script in soup.find_all("script"):
+                    text = script.string or ""
+                    if instrument.replace("_", "") in text or label.replace("/", "") in text:
+                        match = re.search(r'"(?:long|percentLong|pc_long)"\s*:\s*([\d.]+)', text)
+                        if match:
+                            long_pct = float(match.group(1))
+                            match2 = re.search(r'"(?:short|percentShort|pc_short)"\s*:\s*([\d.]+)', text)
+                            short_pct = float(match2.group(1)) if match2 else round(100 - long_pct, 1)
+                            break
+
+                if long_pct:
+                    break
+
+            except Exception:
+                continue
+
+        if long_pct and short_pct:
+            rows.append(PositionRow(
+                source="OANDA",
+                instrument=label,
+                long_pct=long_pct,
+                short_pct=short_pct,
+            ))
+            print(f"  [OANDA] {label}: {long_pct:.1f}% long / {short_pct:.1f}% short")
+        else:
+            print(f"  [OANDA] {label}: could not retrieve data")
+
+        time.sleep(0.5)
 
     return rows
 
