@@ -29,11 +29,12 @@ class PositionRow:
 # IG Client Sentiment
 # ---------------------------------------------------------------------------
 
+# IG UK pages confirmed to render --long-percent sentiment bar
 IG_PAGES = {
-    "AUD/USD": "https://www.ig.com/en/forex/aud-usd",
-    "EUR/USD": "https://www.ig.com/en/forex/eur-usd",
-    "USD/JPY": "https://www.ig.com/en/forex/usd-jpy",
-    "XAU/USD": "https://www.ig.com/en/commodities/gold",
+    "AUD/USD": "https://www.ig.com/uk/forex/aud-usd",
+    "EUR/USD": "https://www.ig.com/uk/forex/eur-usd",
+    "USD/JPY": "https://www.ig.com/uk/forex/usd-jpy",
+    "XAU/USD": "https://www.ig.com/uk/commodities/markets-commodities/gold",
 }
 
 
@@ -174,11 +175,12 @@ def _oanda_fetch(page) -> list[PositionRow]:
 # DailyFX SSI
 # ---------------------------------------------------------------------------
 
+# USD/JPY and XAU/USD dailyfx pages return empty (geo-blocked); use IG UK directly
 DAILYFX_PAGES = {
     "AUD/USD": "https://www.dailyfx.com/aud-usd",
     "EUR/USD": "https://www.dailyfx.com/eur-usd",
-    "USD/JPY": "https://www.dailyfx.com/usd-jpy",
-    "XAU/USD": "https://www.dailyfx.com/gold",
+    "USD/JPY": "https://www.ig.com/uk/forex/usd-jpy",
+    "XAU/USD": "https://www.dailyfx.com/gold-price",  # redirects to IG UK gold page
 }
 
 
@@ -223,15 +225,10 @@ def fetch_all() -> list[PositionRow]:
         )
         page = context.new_page()
 
-        print("Fetching IG Client Sentiment...")
+        print("Fetching IG Client Sentiment (UK pages)...")
         ig = _ig_fetch(page)
         all_rows += ig
         print(f"  => {len(ig)}/4 instruments\n")
-
-        print("Fetching OANDA Open Position Ratios...")
-        oanda = _oanda_fetch(page)
-        all_rows += oanda
-        print(f"  => {len(oanda)}/4 instruments\n")
 
         print("Fetching DailyFX SSI...")
         dfx = _dailyfx_fetch(page)
