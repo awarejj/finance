@@ -37,40 +37,49 @@ IG_PAGES = {
 }
 
 
+def _parse_long_bar(content: str) -> tuple[float, float] | tuple[None, None]:
+    """Parse --long-percent CSS variable from IG/DailyFX sentiment bar."""
+    m = re.search(r'--long-percent:\s*(\d+(?:\.\d+)?)%', content)
+    if m:
+        long_pct = float(m.group(1))
+        return long_pct, round(100 - long_pct, 1)
+    return None, None
+
+
 def _ig_fetch(page) -> list[PositionRow]:
     rows = []
+    captured = {}
+
+    # Intercept XHR responses containing sentiment data
+    def handle_response(response):
+        if "sentiment" in response.url.lower() or "clientsentiment" in response.url.lower():
+            try:
+                data = response.json()
+                long_val = data.get("longPositionPercentage") or data.get("percentLong")
+                short_val = data.get("shortPositionPercentage") or data.get("percentShort")
+                if long_val:
+                    captured[response.url] = (float(long_val), float(short_val))
+            except Exception:
+                pass
+
+    page.on("response", handle_response)
+
     for label, url in IG_PAGES.items():
+        captured.clear()
         try:
             page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(4000)
             content = page.content()
 
             long_pct = short_pct = None
 
-            # Pattern 1: JSON in page source
-            m = re.search(r'"longPositionPercentage"\s*:\s*([\d.]+)', content)
-            if m:
-                long_pct = float(m.group(1))
-                m2 = re.search(r'"shortPositionPercentage"\s*:\s*([\d.]+)', content)
-                short_pct = float(m2.group(1)) if m2 else round(100 - long_pct, 1)
+            # Use intercepted XHR data first
+            if captured:
+                long_pct, short_pct = next(iter(captured.values()))
 
-            # Pattern 2: "X% long" text on page
+            # Fallback: CSS variable in sentiment bar (same pattern as DailyFX - shared codebase)
             if not long_pct:
-                m = re.search(r'(\d+(?:\.\d+)?)\s*%\s*(?:of clients are |)(?:net.)?long', content, re.IGNORECASE)
-                if m:
-                    long_pct = float(m.group(1))
-                    m2 = re.search(r'(\d+(?:\.\d+)?)\s*%\s*(?:of clients are |)(?:net.)?short', content, re.IGNORECASE)
-                    short_pct = float(m2.group(1)) if m2 else round(100 - long_pct, 1)
-
-            # Pattern 3: aria-label or data attributes on sentiment bar
-            if not long_pct:
-                el = page.query_selector('[class*="sentiment"] [class*="long"]')
-                if el:
-                    text = el.inner_text()
-                    m = re.search(r'(\d+(?:\.\d+)?)', text)
-                    if m:
-                        long_pct = float(m.group(1))
-                        short_pct = round(100 - long_pct, 1)
+                long_pct, short_pct = _parse_long_bar(content)
 
             if long_pct and short_pct:
                 rows.append(PositionRow("IG", label, round(long_pct, 1), round(short_pct, 1)))
@@ -79,6 +88,8 @@ def _ig_fetch(page) -> list[PositionRow]:
                 print(f"  [IG] {label}: could not parse sentiment")
         except Exception as exc:
             print(f"  [IG] {label} failed: {exc}")
+
+    page.remove_listener("response", handle_response)
     return rows
 
 
@@ -96,51 +107,66 @@ OANDA_INSTRUMENTS = {
 
 def _oanda_fetch(page) -> list[PositionRow]:
     rows = []
-    url = "https://www.oanda.com/forex-trading/analysis/open-position-ratios"
-    try:
-        page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        page.wait_for_timeout(4000)
-        content = page.content()
+    # Try both known OANDA position ratio URLs
+    oanda_urls = [
+        "https://www.oanda.com/us-en/trading/position-ratios/",
+        "https://www.oanda.com/forex-trading/analysis/open-position-ratios",
+        "https://www.oanda.com/us-en/analysis/open-positions/",
+    ]
 
-        # OANDA loads all instruments in one page as JSON in a script tag
-        # Pattern: {"instrument":"AUD_USD","long":55.2,"short":44.8}
+    content = ""
+    for url in oanda_urls:
+        try:
+            page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(4000)
+            content = page.content()
+            # If we got a 404-style page, try next URL
+            if "doesn't exist" in content or "not found" in content.lower():
+                continue
+            break
+        except Exception:
+            continue
+
+    if not content:
+        print("  [OANDA] all URLs failed")
+        for label in OANDA_INSTRUMENTS:
+            print(f"  [OANDA] {label}: not found in page")
+        return rows
+
+    # Pattern: JSON with instrument + long/short ratios
+    matches = re.findall(
+        r'"instrument"\s*:\s*"([A-Z_]+)"[^}]{0,200}?"(?:long|pc_long|percentLong)"\s*:\s*([\d.]+)[^}]{0,100}?"(?:short|pc_short|percentShort)"\s*:\s*([\d.]+)',
+        content, re.DOTALL
+    )
+    found = {m[0]: (float(m[1]), float(m[2])) for m in matches}
+
+    if not found:
         matches = re.findall(
-            r'"instrument"\s*:\s*"([A-Z_]+)"[^}]*?"(?:long|pc_long|percentLong)"\s*:\s*([\d.]+)[^}]*?"(?:short|pc_short|percentShort)"\s*:\s*([\d.]+)',
-            content
+            r'"(?:long|pc_long|percentLong)"\s*:\s*([\d.]+)[^}]{0,100}?"(?:short|pc_short|percentShort)"\s*:\s*([\d.]+)[^}]{0,200}?"instrument"\s*:\s*"([A-Z_]+)"',
+            content, re.DOTALL
         )
+        found = {m[2]: (float(m[0]), float(m[1])) for m in matches}
 
-        found = {m[0]: (float(m[1]), float(m[2])) for m in matches}
+    for label, instrument in OANDA_INSTRUMENTS.items():
+        if instrument in found:
+            long_pct, short_pct = found[instrument]
+            rows.append(PositionRow("OANDA", label, round(long_pct, 1), round(short_pct, 1)))
+            print(f"  [OANDA] {label}: {long_pct:.1f}% long / {short_pct:.1f}% short")
+        else:
+            # Try visible table cells
+            try:
+                row_el = page.query_selector(f'[data-instrument="{instrument}"], tr:has-text("{label}")')
+                if row_el:
+                    text = row_el.inner_text()
+                    nums = re.findall(r'(\d+(?:\.\d+)?)\s*%', text)
+                    if len(nums) >= 2:
+                        rows.append(PositionRow("OANDA", label, float(nums[0]), float(nums[1])))
+                        print(f"  [OANDA] {label}: {nums[0]}% long / {nums[1]}% short")
+                        continue
+            except Exception:
+                pass
+            print(f"  [OANDA] {label}: not found in page")
 
-        # Also try reversed key order
-        if not found:
-            matches = re.findall(
-                r'"(?:long|pc_long)"\s*:\s*([\d.]+)[^}]*?"(?:short|pc_short)"\s*:\s*([\d.]+)[^}]*?"instrument"\s*:\s*"([A-Z_]+)"',
-                content
-            )
-            found = {m[2]: (float(m[0]), float(m[1])) for m in matches}
-
-        for label, instrument in OANDA_INSTRUMENTS.items():
-            if instrument in found:
-                long_pct, short_pct = found[instrument]
-                rows.append(PositionRow("OANDA", label, round(long_pct, 1), round(short_pct, 1)))
-                print(f"  [OANDA] {label}: {long_pct:.1f}% long / {short_pct:.1f}% short")
-            else:
-                # Try scraping the visible table rows
-                try:
-                    row_el = page.query_selector(f'[data-instrument="{instrument}"], tr:has-text("{instrument.replace("_", "/")}")')
-                    if row_el:
-                        text = row_el.inner_text()
-                        nums = re.findall(r'(\d+(?:\.\d+)?)\s*%', text)
-                        if len(nums) >= 2:
-                            rows.append(PositionRow("OANDA", label, float(nums[0]), float(nums[1])))
-                            print(f"  [OANDA] {label}: {nums[0]}% long / {nums[1]}% short")
-                            continue
-                except Exception:
-                    pass
-                print(f"  [OANDA] {label}: not found in page")
-
-    except Exception as exc:
-        print(f"  [OANDA] failed: {exc}")
     return rows
 
 
@@ -164,23 +190,8 @@ def _dailyfx_fetch(page) -> list[PositionRow]:
             page.wait_for_timeout(3000)
             content = page.content()
 
-            long_pct = short_pct = None
-
-            # Pattern 1: JSON blob
-            for key_long, key_short in [("percentLong", "percentShort"), ("longPercentage", "shortPercentage"), ("pc_long", "pc_short")]:
-                m = re.search(rf'"{key_long}"\s*:\s*([\d.]+)', content)
-                if m:
-                    long_pct = float(m.group(1))
-                    m2 = re.search(rf'"{key_short}"\s*:\s*([\d.]+)', content)
-                    short_pct = float(m2.group(1)) if m2 else round(100 - long_pct, 1)
-                    break
-
-            # Pattern 2: "X% of traders are net-long"
-            if not long_pct:
-                m = re.search(r'(\d+(?:\.\d+)?)\s*%\s*of\s*(?:retail\s*)?traders?\s*are\s*net.long', content, re.IGNORECASE)
-                if m:
-                    long_pct = float(m.group(1))
-                    short_pct = round(100 - long_pct, 1)
+            # Confirmed pattern from debug: <div class="price-ticket__long-bar" style="--long-percent: 65%">
+            long_pct, short_pct = _parse_long_bar(content)
 
             if long_pct and short_pct:
                 rows.append(PositionRow("DailyFX", label, round(long_pct, 1), round(short_pct, 1)))
