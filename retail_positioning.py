@@ -39,38 +39,79 @@ class PositionRow:
 # IG Client Sentiment
 # ---------------------------------------------------------------------------
 
-IG_SENTIMENT_IDS = {
-    "AUD/USD": "AUDUSD",
-    "EUR/USD": "EURUSD",
-    "USD/JPY": "USDJPY",
-    "XAU/USD": "GOLD",
+IG_PAGE_SLUGS = {
+    "AUD/USD": "aud-usd",
+    "EUR/USD": "eur-usd",
+    "USD/JPY": "usd-jpy",
+    "XAU/USD": "gold",
 }
 
 
 def _ig_fetch() -> list[PositionRow]:
+    """Scrape IG client sentiment from their public market pages."""
+    import re
+    from bs4 import BeautifulSoup
+
     rows: list[PositionRow] = []
 
-    for label, market_id in IG_SENTIMENT_IDS.items():
-        url = f"https://api.ig.com/gateway/deal/clientsentiment/{market_id}"
-        headers = {
-            **HEADERS,
-            "Content-Type": "application/json; charset=UTF-8",
-            "Accept": "application/json; charset=UTF-8",
-            "Version": "1",
-        }
+    for label, slug in IG_PAGE_SLUGS.items():
+        # IG hosts sentiment on their forex/commodities market pages
+        if label == "XAU/USD":
+            url = f"https://www.ig.com/en/commodities/markets-to-trade-now/{slug}-price"
+        else:
+            url = f"https://www.ig.com/en/forex/markets-to-trade-now/{slug}-chart"
+
         try:
-            resp = requests.get(url, headers=headers, timeout=TIMEOUT)
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             resp.raise_for_status()
-            data = resp.json()
-            long_pct = float(data["longPositionPercentage"])
-            short_pct = float(data["shortPositionPercentage"])
-            rows.append(PositionRow(
-                source="IG",
-                instrument=label,
-                long_pct=round(long_pct, 1),
-                short_pct=round(short_pct, 1),
-            ))
-            print(f"  [IG] {label}: {long_pct:.1f}% long / {short_pct:.1f}% short")
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            long_pct = short_pct = None
+
+            # Try JSON embedded in <script> tags
+            for script in soup.find_all("script"):
+                text = script.string or ""
+                if "longPositionPercentage" in text or "clientSentiment" in text:
+                    try:
+                        match = re.search(r'"longPositionPercentage"\s*:\s*([\d.]+)', text)
+                        if match:
+                            long_pct = float(match.group(1))
+                        match = re.search(r'"shortPositionPercentage"\s*:\s*([\d.]+)', text)
+                        if match:
+                            short_pct = float(match.group(1))
+                        if long_pct and short_pct:
+                            break
+                    except Exception:
+                        pass
+
+            # Try data attributes on sentiment widget elements
+            if not long_pct:
+                for attr in ["data-long", "data-sentiment-long", "data-percent-long"]:
+                    el = soup.find(attrs={attr: True})
+                    if el:
+                        long_pct = float(el[attr])
+                        short_key = attr.replace("long", "short")
+                        short_pct = float(el.get(short_key, 100 - long_pct))
+                        break
+
+            # Try plain text pattern "X% Long  Y% Short"
+            if not long_pct:
+                match = re.search(r'(\d+(?:\.\d+)?)\s*%\s*[Ll]ong.*?(\d+(?:\.\d+)?)\s*%\s*[Ss]hort', resp.text)
+                if match:
+                    long_pct = float(match.group(1))
+                    short_pct = float(match.group(2))
+
+            if long_pct and short_pct:
+                rows.append(PositionRow(
+                    source="IG",
+                    instrument=label,
+                    long_pct=round(long_pct, 1),
+                    short_pct=round(short_pct, 1),
+                ))
+                print(f"  [IG] {label}: {long_pct:.1f}% long / {short_pct:.1f}% short")
+            else:
+                print(f"  [IG] {label}: could not parse sentiment from page")
+
         except Exception as exc:
             print(f"  [IG] {label} failed: {exc}")
 
